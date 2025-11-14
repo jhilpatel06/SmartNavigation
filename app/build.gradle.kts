@@ -41,6 +41,7 @@ android {
         viewBinding = true
     }
 
+
     packaging {
         resources.excludes += "/META-INF/*"
     }
@@ -51,8 +52,11 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.activity.compose)
+    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.0")
 
     // Jetpack Compose
+    // Jetpack Compose Navigation
+    implementation("androidx.navigation:navigation-compose:2.8.3")
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.ui.graphics)
@@ -64,6 +68,9 @@ dependencies {
     implementation("androidx.camera:camera-camera2:1.3.3")
     implementation("androidx.camera:camera-lifecycle:1.3.3")
     implementation("androidx.camera:camera-view:1.3.3")
+
+    // Accompanist Permissions
+    implementation("com.google.accompanist:accompanist-permissions:0.32.0")
 
     // Sensor + Coroutines (for real-time IMU)
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.3")
