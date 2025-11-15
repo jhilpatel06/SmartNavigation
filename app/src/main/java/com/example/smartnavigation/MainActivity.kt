@@ -9,20 +9,30 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.viewmodel.compose.viewModel // <-- ADD THIS IMPORT
+import androidx.navigation.NavController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import com.example.smartnavigation.ui.theme.SmartNavigationTheme // <-- Ensure this is imported
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
-            MaterialTheme {
+            // Use your project's theme
+            SmartNavigationTheme {
                 val navController = rememberNavController()
+
+                // Create the ViewModel that will be shared
+                val sharedViewModel: SharedNavViewModel = viewModel()
+
                 NavHost(navController, startDestination = "home") {
                     composable("home") { HomeScreen(navController) }
-                    composable("dead_reckoning") { DeadReckoningScreen() }
-                    composable("slam") { SlamScreen() }
+
+                    // Pass the ViewModel to both screens
+                    composable("dead_reckoning") { DeadReckoningScreen(sharedViewModel) }
+                    composable("slam") { SlamScreen(sharedViewModel) }
                 }
             }
         }
@@ -30,7 +40,7 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-fun HomeScreen(navController: androidx.navigation.NavController) {
+fun HomeScreen(navController: NavController) {
     Surface(modifier = Modifier.fillMaxSize()) {
         Column(
             modifier = Modifier
@@ -52,7 +62,7 @@ fun HomeScreen(navController: androidx.navigation.NavController) {
             Button(
                 onClick = { navController.navigate("slam") },
                 modifier = Modifier.fillMaxWidth()
-            ) { Text("SLAM (Camera)") }
+            ) { Text("SLAM (AR Pin)") } // <-- Changed text
         }
     }
 }

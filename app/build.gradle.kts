@@ -30,6 +30,9 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
+
+        // Add this to prevent build errors with ARCore
+        isCoreLibraryDesugaringEnabled = true // <--- ADD THIS
     }
 
     kotlinOptions {
@@ -48,6 +51,17 @@ android {
 }
 
 dependencies {
+    // --- ADD ALL OF THESE --- //
+    // ARCore (SLAM)
+    implementation("com.google.ar:core:1.44.0")
+    implementation("com.google.ar.sceneform:core:1.17.1")
+    implementation("com.google.ar.sceneform.ux:sceneform-ux:1.17.1")
+
+    // Desugaring, required for ARCore
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.4")
+    // --- END OF ADDITIONS --- //
+
+
     // Core Android
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
@@ -63,7 +77,7 @@ dependencies {
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.compose.material3)
 
-    // CameraX for SLAM
+    // CameraX for SLAM (These are from your original file, now replaced by ARCore)
     implementation("androidx.camera:camera-core:1.3.3")
     implementation("androidx.camera:camera-camera2:1.3.3")
     implementation("androidx.camera:camera-lifecycle:1.3.3")
