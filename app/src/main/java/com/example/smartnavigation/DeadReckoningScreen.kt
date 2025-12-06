@@ -1,58 +1,69 @@
 package com.example.smartnavigation
 
-
 import android.content.Context
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
 import kotlin.math.*
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DeadReckoningScreen() {
-    val context = androidx.compose.ui.platform.LocalContext.current
-    val sensorManager = remember { context.getSystemService(Context.SENSOR_SERVICE) as SensorManager }
+
+    val context = LocalContext.current
+    val sensorManager = remember {
+        context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
+    }
 
     val position = remember { mutableStateListOf(0f, 0f, 0f) }
     val velocity = remember { mutableStateListOf(0f, 0f, 0f) }
-    val pathPoints = remember { mutableStateListOf<Pair<Float, Float>>() }
+    val path = remember { mutableStateListOf<Triple<Float, Float, Float>>() }
     var isRunning by remember { mutableStateOf(false) }
 
-    val sensorListener = remember {
+    // UI Sliders for 3D Rotation
+    var roll by remember { mutableStateOf(0f) }
+    var pitch by remember { mutableStateOf(0f) }
+    var yaw by remember { mutableStateOf(0f) }
+
+    val listener = remember {
         object : SensorEventListener {
-            var accelRaw = FloatArray(3)
-            var rotationVector = FloatArray(4)
-            var lastTimestamp = 0L
+
+            var accel = FloatArray(3)
+            var rot = FloatArray(4)
+            var lastTS = 0L
             val alpha = 0.6f
 
-            override fun onSensorChanged(event: SensorEvent) {
-                when (event.sensor.type) {
+            override fun onSensorChanged(e: SensorEvent) {
+                when (e.sensor.type) {
+
                     Sensor.TYPE_LINEAR_ACCELERATION -> {
-                        val raw = event.values
-                        for (i in 0..2)
-                            accelRaw[i] = alpha * accelRaw[i] + (1 - alpha) * raw[i]
-                        if (isRunning) integrate(event.timestamp)
+                        accel[0] = alpha * accel[0] + (1 - alpha) * e.values[0]
+                        accel[1] = alpha * accel[1] + (1 - alpha) * e.values[1]
+                        accel[2] = alpha * accel[2] + (1 - alpha) * e.values[2]
+                        if (isRunning) integrate(e.timestamp)
                     }
 
                     Sensor.TYPE_ROTATION_VECTOR -> {
-                        if (event.values.size >= 4)
-                            rotationVector = event.values.clone()
+                        rot = if (e.values.size >= 4) e.values.clone()
                         else {
-                            val x = event.values[0]
-                            val y = event.values[1]
-                            val z = event.values[2]
-                            rotationVector = floatArrayOf(x, y, z, sqrt(max(0f, 1f - x * x - y * y - z * z)))
+                            val x = e.values[0]
+                            val y = e.values[1]
+                            val z = e.values[2]
+                            floatArrayOf(
+                                x, y, z,
+                                sqrt(max(0f, 1f - x * x - y * y - z * z))
+                            )
                         }
                     }
                 }
@@ -60,38 +71,64 @@ fun DeadReckoningScreen() {
 
             override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 
+            // FIXED DRIFT + SHOW COORDINATES
             private fun integrate(ts: Long) {
-                if (lastTimestamp == 0L) {
-                    lastTimestamp = ts
+                if (lastTS == 0L) {
+                    lastTS = ts
                     return
                 }
-                val dt = (ts - lastTimestamp) / 1e9f
-                lastTimestamp = ts
-                if (dt <= 0f || dt > 0.5f) return
 
-                val aWorld = deviceToWorldAccel(accelRaw, rotationVector)
-                for (i in 0..2) {
-                    val ax = if (abs(aWorld[i]) < 0.02f) 0f else aWorld[i]
-                    velocity[i] += ax * dt
-                    position[i] += velocity[i] * dt
-                }
-                pathPoints.add(position[0] to position[1])
-                if (pathPoints.size > 2000) pathPoints.removeAt(0)
+                val dt = (ts - lastTS) / 1e9f
+                lastTS = ts
+
+                if (dt <= 0f || dt > 0.2f) return
+
+                val aw = toWorld(accel, rot)
+
+                // Threshold to remove noise
+                val th = 0.03f
+
+                val ax = if (abs(aw[0]) < th) 0f else aw[0]
+                val ay = if (abs(aw[1]) < th) 0f else aw[1]
+
+                // FIX: Prevent Z drift (gravity noise)
+                val az = if (abs(aw[2]) < 0.15f) 0f else aw[2]
+
+                // Vel update
+                velocity[0] += ax * dt
+                velocity[1] += ay * dt
+                velocity[2] += az * dt
+
+                velocity[0] *= 0.92f
+                velocity[1] *= 0.92f
+                velocity[2] *= 0.92f
+
+                // Position update
+                position[0] += velocity[0] * dt
+                position[1] += velocity[1] * dt
+                position[2] += velocity[2] * dt
+
+                path.add(Triple(position[0], position[1], position[2]))
+                if (path.size > 3000) path.removeAt(0)
             }
 
-            private fun deviceToWorldAccel(accel: FloatArray, q: FloatArray): FloatArray {
-                val qx = q[0].toDouble(); val qy = q[1].toDouble(); val qz = q[2].toDouble(); val qw = q[3].toDouble()
-                val vx = accel[0].toDouble(); val vy = accel[1].toDouble(); val vz = accel[2].toDouble()
+            // Quaternion rotation
+            private fun toWorld(a: FloatArray, q: FloatArray): FloatArray {
+                val (x, y, z, w) = q
+                val vx = a[0].toDouble()
+                val vy = a[1].toDouble()
+                val vz = a[2].toDouble()
 
-                val ix = qw * vx + qy * vz - qz * vy
-                val iy = qw * vy + qz * vx - qx * vz
-                val iz = qw * vz + qx * vy - qy * vx
-                val iw = -qx * vx - qy * vy - qz * vz
+                val ix = w * vx + y * vz - z * vy
+                val iy = w * vy + z * vx - x * vz
+                val iz = w * vz + x * vy - y * vx
+                val iw = -x * vx - y * vy - z * vz
 
-                val wx = ix * qw - iw * qx + iy * qz - iz * qy
-                val wy = iy * qw - iw * qy + iz * qx - ix * qz
-                val wz = iz * qw - iw * qz + ix * qy - iy * qx
-                return floatArrayOf(wx.toFloat(), wy.toFloat(), wz.toFloat())
+                val px = ix * w - iw * x + iy * z - iz * y
+                val py = iy * w - iw * y + iz * x - ix * z
+                val pz = iz * w - iw * z + ix * y - iy * x
+
+                return floatArrayOf(px.toFloat(), py.toFloat(), pz.toFloat())
             }
         }
     }
@@ -99,63 +136,147 @@ fun DeadReckoningScreen() {
     DisposableEffect(isRunning) {
         if (isRunning) {
             sensorManager.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION)?.also {
-                sensorManager.registerListener(sensorListener, it, SensorManager.SENSOR_DELAY_GAME)
+                sensorManager.registerListener(listener, it, SensorManager.SENSOR_DELAY_GAME)
             }
             sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)?.also {
-                sensorManager.registerListener(sensorListener, it, SensorManager.SENSOR_DELAY_GAME)
+                sensorManager.registerListener(listener, it, SensorManager.SENSOR_DELAY_GAME)
             }
-        } else {
-            sensorManager.unregisterListener(sensorListener)
-        }
-        onDispose { sensorManager.unregisterListener(sensorListener) }
+        } else sensorManager.unregisterListener(listener)
+
+        onDispose { sensorManager.unregisterListener(listener) }
     }
 
-    Column(Modifier.padding(16.dp)) {
-        Text("Dead Reckoning", fontSize = 22.sp, fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(12.dp))
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(onClick = { isRunning = true }, Modifier.weight(1f)) { Text("Start") }
-            Button(onClick = { isRunning = false }, Modifier.weight(1f)) { Text("Stop") }
-            Button(onClick = {
-                for (i in 0..2) { position[i] = 0f; velocity[i] = 0f }
-                pathPoints.clear()
-            }, Modifier.weight(1f)) { Text("Reset") }
+    // UI
+    Scaffold(
+        topBar = {
+            CenterAlignedTopAppBar(
+                title = { Text("Dead Reckoning 3D", fontWeight = FontWeight.Bold) }
+            )
         }
-        Spacer(Modifier.height(10.dp))
-        Text("Position: X=${position[0]}  Y=${position[1]}  Z=${position[2]}")
-        TrajectoryCanvas(points = pathPoints.toList())
+    ) { pad ->
+
+        Column(
+            Modifier.padding(pad).padding(12.dp)
+        ) {
+
+            // Buttons
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button({ isRunning = true }, Modifier.weight(1f)) { Text("Start") }
+                Button({ isRunning = false }, Modifier.weight(1f)) { Text("Stop") }
+                Button({
+                    position[0] = 0f; velocity[0] = 0f
+                    position[1] = 0f; velocity[1] = 0f
+                    position[2] = 0f; velocity[2] = 0f
+                    path.clear()
+                }, Modifier.weight(1f)) { Text("Reset") }
+            }
+
+            Spacer(Modifier.height(10.dp))
+
+            // SHOW COORDINATES
+            Text(
+                "X = %.3f   Y = %.3f   Z = %.3f".format(
+                    position[0], position[1], position[2]
+                ),
+                fontWeight = FontWeight.Bold,
+                color = Color.Yellow
+            )
+
+            Spacer(Modifier.height(12.dp))
+
+            Text("3D View Rotation", fontWeight = FontWeight.Bold)
+
+            SliderControl("Roll", roll) { roll = it }
+            SliderControl("Pitch", pitch) { pitch = it }
+            SliderControl("Yaw", yaw) { yaw = it }
+
+            Spacer(Modifier.height(12.dp))
+
+            ThreeDCanvas(path, roll, pitch, yaw)
+        }
     }
 }
 
+// ───────────────────────────────────────────────
+// SLIDERS
+// ───────────────────────────────────────────────
+
 @Composable
-fun TrajectoryCanvas(points: List<Pair<Float, Float>>) {
+fun SliderControl(label: String, value: Float, onChange: (Float) -> Unit) {
+    Text("$label: ${value.toInt()}°")
+    Slider(
+        value = value,
+        onValueChange = onChange,
+        valueRange = -180f..180f
+    )
+}
+
+// ───────────────────────────────────────────────
+// 3D GRAPH + AXES + GRID
+// ───────────────────────────────────────────────
+
+@Composable
+fun ThreeDCanvas(
+    points: List<Triple<Float, Float, Float>>,
+    roll: Float,
+    pitch: Float,
+    yaw: Float
+) {
+
     Canvas(
         modifier = Modifier
             .fillMaxWidth()
-            .height(380.dp)
-            .padding(8.dp)
+            .height(420.dp)
+            .padding(6.dp)
     ) {
         if (points.isEmpty()) return@Canvas
-        val xs = points.map { it.first }
-        val ys = points.map { it.second }
-        val minX = xs.minOrNull() ?: 0f
-        val maxX = xs.maxOrNull() ?: 0f
-        val minY = ys.minOrNull() ?: 0f
-        val maxY = ys.maxOrNull() ?: 0f
-        val scale = min(size.width / (maxX - minX + 0.1f), size.height / (maxY - minY + 0.1f))
+
         val cx = size.width / 2f
         val cy = size.height / 2f
-        for (i in 0 until points.size - 1) {
-            val (x1, y1) = points[i]
-            val (x2, y2) = points[i + 1]
-            drawLine(
-                color = Color.Blue,
-                start = Offset(cx + (x1 - (minX + maxX) / 2f) * scale, cy - (y1 - (minY + maxY) / 2f) * scale),
-                end = Offset(cx + (x2 - (minX + maxX) / 2f) * scale, cy - (y2 - (minY + maxY) / 2f) * scale),
-                strokeWidth = 4f
-            )
+
+        val r = roll * PI / 180
+        val p = pitch * PI / 180
+        val w = yaw * PI / 180
+
+        fun rot3D(pt: Triple<Float, Float, Float>): Offset {
+            var (x, y, z) = pt
+
+            // Yaw
+            val x1 = x * cos(w) - y * sin(w)
+            val y1 = x * sin(w) + y * cos(w)
+
+            // Pitch
+            val y2 = y1 * cos(p) - z * sin(p)
+            val z1 = y1 * sin(p) + z * cos(p)
+
+            // Roll
+            val x2 = x1 * cos(r) + z1 * sin(r)
+            val z2 = -x1 * sin(r) + z1 * cos(r)
+
+            val scale = 180f
+            return Offset(cx + x2.toFloat() * scale, cy - y2.toFloat() * scale)
         }
-        val (lx, ly) = points.last()
-        drawCircle(Color.Red, 8f, Offset(cx + (lx - (minX + maxX) / 2f) * scale, cy - (ly - (minY + maxY) / 2f) * scale))
+
+        // GRID
+        val g = 0.2f
+        val c = 6
+        for (i in -c..c) {
+            val s = i * g
+            drawLine(Color(0x22FFFFFF), rot3D(Triple(s, -c * g, 0f)), rot3D(Triple(s, c * g, 0f)), 1f)
+            drawLine(Color(0x22FFFFFF), rot3D(Triple(-c * g, s, 0f)), rot3D(Triple(c * g, s, 0f)), 1f)
+        }
+
+        // AXES
+        val o = rot3D(Triple(0f, 0f, 0f))
+        drawLine(Color.Red, o, rot3D(Triple(1f, 0f, 0f)), 4f)
+        drawLine(Color.Green, o, rot3D(Triple(0f, 1f, 0f)), 4f)
+        drawLine(Color.Blue, o, rot3D(Triple(0f, 0f, 1f)), 4f)
+
+        // PATH
+        for (i in 0 until points.size - 1) {
+            drawLine(Color.Cyan, rot3D(points[i]), rot3D(points[i + 1]), 3f)
+        }
+
+        drawCircle(Color.Yellow, 6f, rot3D(points.last()))
     }
 }
