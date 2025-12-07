@@ -99,9 +99,9 @@ fun DeadReckoningScreen() {
                 velocity[1] += ay * dt
                 velocity[2] += az * dt
 
-                velocity[0] *= 0.92f
-                velocity[1] *= 0.92f
-                velocity[2] *= 0.92f
+                velocity[0] *= 0.80f
+                velocity[1] *= 0.80f
+                velocity[2] *= 0.80f
 
                 // Position update
                 position[0] += velocity[0] * dt
