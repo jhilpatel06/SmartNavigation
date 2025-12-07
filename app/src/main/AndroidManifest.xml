@@ -10,11 +10,15 @@
     <uses-permission android:name="android.permission.BODY_SENSORS" />
 
     <!-- Features -->
-    <uses-feature android:name="android.hardware.camera.ar" android:required="false" />
+    <!-- Changed to required="true" for ARCore SLAM -->
+    <uses-feature android:name="android.hardware.camera.ar" android:required="true" />
     <uses-feature android:name="android.hardware.sensor.accelerometer" android:required="true" />
     <uses-feature android:name="android.hardware.sensor.gyroscope" android:required="true" />
-    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera" android:required="true" />
     <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
+
+    <!-- OpenGL ES 2.0 required for ARCore -->
+    <uses-feature android:glEsVersion="0x00020000" android:required="true" />
 
     <application
         android:allowBackup="true"
@@ -23,12 +27,14 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.SmartNavigation">
 
-        <meta-data android:name="com.google.ar.core" android:value="optional" />
+        <!-- Changed from "optional" to "required" for proper ARCore functionality -->
+        <meta-data android:name="com.google.ar.core" android:value="required" />
 
         <activity
             android:name=".MainActivity"
-            android:exported="true">
-
+            android:exported="true"
+            android:screenOrientation="portrait"
+            android:configChanges="orientation|screenSize|keyboardHidden">
 
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

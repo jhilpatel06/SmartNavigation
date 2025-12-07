@@ -91,4 +91,14 @@ dependencies {
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
     debugImplementation(libs.androidx.compose.ui.tooling)
     debugImplementation(libs.androidx.compose.ui.test.manifest)
+    implementation("androidx.compose.material:material-icons-extended:1.6.0")
+    // ARCore
+    implementation("com.google.ar:core:1.41.0")
+
+    // Accompanist permissions
+    implementation("com.google.accompanist:accompanist-permissions:0.32.0")
+
+    // Compose
+    implementation("androidx.compose.material3:material3:1.2.0")
+
 }
