@@ -205,6 +205,27 @@ class BackgroundRenderer {
         return shader
     }
 
+    private fun allocFloatBuffer(array: FloatArray): FloatBuffer =
+        ByteBuffer.allocateDirect(array.size * FLOAT_SIZE)
+            .order(ByteOrder.nativeOrder())
+            .asFloatBuffer()
+            .apply {
+                put(array)
+                position(0)
+            }
+
+    private fun loadShader(type: Int, code: String): Int =
+        GLES20.glCreateShader(type).also { shader ->
+            GLES20.glShaderSource(shader, code)
+            GLES20.glCompileShader(shader)
+            val compiled = IntArray(1)
+            GLES20.glGetShaderiv(shader, GLES20.GL_COMPILE_STATUS, compiled, 0)
+            if (compiled[0] == 0) {
+                Log.e("BackgroundRenderer", "Shader compile error: ${GLES20.glGetShaderInfoLog(shader)}")
+                GLES20.glDeleteShader(shader)
+            }
+        }
+
     fun draw(frame: Frame) {
         if (quadProgram == 0) return
 
