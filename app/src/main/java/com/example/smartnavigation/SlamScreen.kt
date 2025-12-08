@@ -1,12 +1,14 @@
 package com.example.smartnavigation
 
 import android.Manifest
+import android.app.Activity
 import android.content.Context
+import android.opengl.GLES11Ext
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
-import android.opengl.Matrix
 import android.util.Log
-import androidx.compose.animation.core.*
+import android.view.Surface
+import android.view.View
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -35,11 +37,17 @@ import com.google.ar.core.exceptions.UnavailableApkTooOldException
 import com.google.ar.core.exceptions.UnavailableDeviceNotCompatibleException
 import com.google.ar.core.exceptions.UnavailableSdkTooOldException
 import com.google.ar.core.exceptions.UnavailableUserDeclinedInstallationException
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.FloatBuffer
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
-import kotlin.math.abs
 import kotlin.math.max
-import kotlin.math.min
+import kotlin.math.sqrt
+
+// -----------------------------------------------------------------------------
+// Data Models + Helpers
+// -----------------------------------------------------------------------------
 
 data class PathPoint(
     val x: Float,
@@ -57,38 +65,58 @@ fun Pose.toShortString(): String {
 
 fun Float.format(digits: Int) = "%.${digits}f".format(this)
 
+// -----------------------------------------------------------------------------
+// BackgroundRenderer — Optimized + Official ARCore UV Transform + Orientation Fix
+// -----------------------------------------------------------------------------
+
 class BackgroundRenderer {
+
+    var textureId: Int = -1
+        private set
+
     private var quadProgram = 0
     private var quadPositionParam = 0
     private var quadTexCoordParam = 0
-    var textureId = -1
-        private set
+    private var textureUniform = 0
 
-    private val QUAD_COORDS = floatArrayOf(
-        -1.0f, -1.0f, 0.0f,
-        -1.0f, +1.0f, 0.0f,
-        +1.0f, -1.0f, 0.0f,
-        +1.0f, +1.0f, 0.0f
-    )
+    private lateinit var quadVertices: FloatBuffer
+    private lateinit var quadTexCoords: FloatBuffer
+    private lateinit var quadTexCoordsTransformed: FloatBuffer
 
-    private val QUAD_TEXCOORDS = floatArrayOf(
-        0.0f, 1.0f,
-        0.0f, 0.0f,
-        1.0f, 1.0f,
-        1.0f, 0.0f
-    )
+    companion object {
+        private const val FLOAT_SIZE = 4
+        private const val COORDS_PER_VERTEX = 3
+        private const val TEXCOORDS_PER_VERTEX = 2
+
+        // NDC full-screen quad
+        private val QUAD_COORDS = floatArrayOf(
+            -1f, -1f, 0f,
+            -1f, +1f, 0f,
+            +1f, -1f, 0f,
+            +1f, +1f, 0f
+        )
+
+        // Initial UVs (ARCore will transform them)
+        private val QUAD_TEXCOORDS = floatArrayOf(
+            0f, 1f,
+            0f, 0f,
+            1f, 1f,
+            1f, 0f
+        )
+    }
 
     fun createOnGlThread(context: Context) {
         val textures = IntArray(1)
         GLES20.glGenTextures(1, textures, 0)
         textureId = textures[0]
-        val textureTarget = 0x8D65 // GL_TEXTURE_EXTERNAL_OES
 
-        GLES20.glBindTexture(textureTarget, textureId)
-        GLES20.glTexParameteri(textureTarget, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
-        GLES20.glTexParameteri(textureTarget, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
 
-        val vertexShader = """
+        val vertexShaderCode = """
             attribute vec4 a_Position;
             attribute vec2 a_TexCoord;
             varying vec2 v_TexCoord;
@@ -98,7 +126,7 @@ class BackgroundRenderer {
             }
         """.trimIndent()
 
-        val fragmentShader = """
+        val fragmentShaderCode = """
             #extension GL_OES_EGL_image_external : require
             precision mediump float;
             uniform samplerExternalOES sTexture;
@@ -108,45 +136,96 @@ class BackgroundRenderer {
             }
         """.trimIndent()
 
-        val vs = GLES20.glCreateShader(GLES20.GL_VERTEX_SHADER)
-        GLES20.glShaderSource(vs, vertexShader)
-        GLES20.glCompileShader(vs)
+        val vs = loadShader(GLES20.GL_VERTEX_SHADER, vertexShaderCode)
+        val fs = loadShader(GLES20.GL_FRAGMENT_SHADER, fragmentShaderCode)
 
-        val fs = GLES20.glCreateShader(GLES20.GL_FRAGMENT_SHADER)
-        GLES20.glShaderSource(fs, fragmentShader)
-        GLES20.glCompileShader(fs)
+        if (vs == 0 || fs == 0) {
+            Log.e("BackgroundRenderer", "Shader creation failed; vs=$vs fs=$fs")
+            quadProgram = 0
+            return
+        }
 
-        quadProgram = GLES20.glCreateProgram()
-        GLES20.glAttachShader(quadProgram, vs)
-        GLES20.glAttachShader(quadProgram, fs)
-        GLES20.glLinkProgram(quadProgram)
-        GLES20.glUseProgram(quadProgram)
+        val program = GLES20.glCreateProgram()
+        if (program == 0) {
+            Log.e("BackgroundRenderer", "Could not create GL program")
+            quadProgram = 0
+            return
+        }
+
+        GLES20.glAttachShader(program, vs)
+        GLES20.glAttachShader(program, fs)
+        GLES20.glLinkProgram(program)
+
+        val linkStatus = IntArray(1)
+        GLES20.glGetProgramiv(program, GLES20.GL_LINK_STATUS, linkStatus, 0)
+        if (linkStatus[0] == 0) {
+            Log.e("BackgroundRenderer", "Program link error: ${GLES20.glGetProgramInfoLog(program)}")
+            GLES20.glDeleteProgram(program)
+            quadProgram = 0
+            return
+        }
+
+        quadProgram = program
 
         quadPositionParam = GLES20.glGetAttribLocation(quadProgram, "a_Position")
         quadTexCoordParam = GLES20.glGetAttribLocation(quadProgram, "a_TexCoord")
+        textureUniform = GLES20.glGetUniformLocation(quadProgram, "sTexture")
+
+        quadVertices = allocFloatBuffer(QUAD_COORDS)
+        quadTexCoords = allocFloatBuffer(QUAD_TEXCOORDS)
+        quadTexCoordsTransformed = ByteBuffer.allocateDirect(QUAD_TEXCOORDS.size * FLOAT_SIZE)
+            .order(ByteOrder.nativeOrder())
+            .asFloatBuffer()
+    }
+
+    private fun allocFloatBuffer(array: FloatArray): FloatBuffer =
+        ByteBuffer.allocateDirect(array.size * FLOAT_SIZE)
+            .order(ByteOrder.nativeOrder())
+            .asFloatBuffer()
+            .apply {
+                put(array)
+                position(0)
+            }
+
+    private fun loadShader(type: Int, code: String): Int {
+        val shader = GLES20.glCreateShader(type)
+        if (shader == 0) {
+            Log.e("BackgroundRenderer", "Could not create shader of type $type")
+            return 0
+        }
+        GLES20.glShaderSource(shader, code)
+        GLES20.glCompileShader(shader)
+        val compiled = IntArray(1)
+        GLES20.glGetShaderiv(shader, GLES20.GL_COMPILE_STATUS, compiled, 0)
+        if (compiled[0] == 0) {
+            Log.e("BackgroundRenderer", "Shader compile error: ${GLES20.glGetShaderInfoLog(shader)}")
+            GLES20.glDeleteShader(shader)
+            return 0
+        }
+        return shader
     }
 
     fun draw(frame: Frame) {
+        if (quadProgram == 0) return
+
         GLES20.glDisable(GLES20.GL_DEPTH_TEST)
         GLES20.glDepthMask(false)
 
-        GLES20.glBindTexture(0x8D65, textureId)
+        quadTexCoords.position(0)
+        quadTexCoordsTransformed.position(0)
+        frame.transformDisplayUvCoords(quadTexCoords, quadTexCoordsTransformed)
 
         GLES20.glUseProgram(quadProgram)
-        GLES20.glVertexAttribPointer(quadPositionParam, 3, GLES20.GL_FLOAT, false, 0,
-            java.nio.ByteBuffer.allocateDirect(QUAD_COORDS.size * 4).apply {
-                order(java.nio.ByteOrder.nativeOrder())
-                asFloatBuffer().put(QUAD_COORDS)
-                position(0)
-            })
-        GLES20.glVertexAttribPointer(quadTexCoordParam, 2, GLES20.GL_FLOAT, false, 0,
-            java.nio.ByteBuffer.allocateDirect(QUAD_TEXCOORDS.size * 4).apply {
-                order(java.nio.ByteOrder.nativeOrder())
-                asFloatBuffer().put(QUAD_TEXCOORDS)
-                position(0)
-            })
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId)
+        GLES20.glUniform1i(textureUniform, 0)
 
+        quadVertices.position(0)
+        GLES20.glVertexAttribPointer(quadPositionParam, COORDS_PER_VERTEX, GLES20.GL_FLOAT, false, 0, quadVertices)
         GLES20.glEnableVertexAttribArray(quadPositionParam)
+
+        quadTexCoordsTransformed.position(0)
+        GLES20.glVertexAttribPointer(quadTexCoordParam, TEXCOORDS_PER_VERTEX, GLES20.GL_FLOAT, false, 0, quadTexCoordsTransformed)
         GLES20.glEnableVertexAttribArray(quadTexCoordParam)
 
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
@@ -158,6 +237,9 @@ class BackgroundRenderer {
         GLES20.glEnable(GLES20.GL_DEPTH_TEST)
     }
 }
+// -----------------------------------------------------------------------------
+// ARCore Renderer – stable tracking config + per-frame display geometry update
+// -----------------------------------------------------------------------------
 
 class ArCoreRenderer(
     private val context: Context,
@@ -166,25 +248,36 @@ class ArCoreRenderer(
 
     private var session: Session? = null
     private val backgroundRenderer = BackgroundRenderer()
-    private var isTracking = false
 
-    fun createSession(): Boolean {
+    private var viewportWidth: Int = 0
+    private var viewportHeight: Int = 0
+
+    // Create ARCore session once
+    fun createSessionIfNeeded(): Boolean {
+        if (session != null) return true
+
         return try {
-            if (session != null) return true
-
             val newSession = Session(context)
+
             val config = Config(newSession).apply {
                 updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
                 focusMode = Config.FocusMode.AUTO
+
+                // Better tracking stability
                 planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
-                lightEstimationMode = Config.LightEstimationMode.DISABLED
+                lightEstimationMode = Config.LightEstimationMode.ENVIRONMENTAL_HDR
+                depthMode = Config.DepthMode.AUTOMATIC
+                instantPlacementMode = Config.InstantPlacementMode.LOCAL_Y_UP
             }
+
             newSession.configure(config)
             session = newSession
-            Log.d("ArCoreRenderer", "Session created successfully")
+
+            Log.d("ArCoreRenderer", "ARCore session created & configured")
             true
         } catch (e: Exception) {
             Log.e("ArCoreRenderer", "Failed to create session", e)
+            onPoseUpdate("Session error: ${e.message}", TrackingState.STOPPED, null)
             false
         }
     }
@@ -192,23 +285,28 @@ class ArCoreRenderer(
     fun resume() {
         try {
             session?.resume()
-            isTracking = true
             Log.d("ArCoreRenderer", "Session resumed")
         } catch (e: CameraNotAvailableException) {
             Log.e("ArCoreRenderer", "Camera not available", e)
+            onPoseUpdate("Camera unavailable", TrackingState.STOPPED, null)
         }
     }
 
     fun pause() {
-        session?.pause()
-        isTracking = false
-        Log.d("ArCoreRenderer", "Session paused")
+        try {
+            session?.pause()
+            Log.d("ArCoreRenderer", "Session paused")
+        } catch (e: Exception) {
+            Log.e("ArCoreRenderer", "Error pausing session", e)
+        }
     }
 
     fun destroy() {
-        session?.close()
+        try {
+            session?.close()
+        } catch (_: Exception) {
+        }
         session = null
-        isTracking = false
         Log.d("ArCoreRenderer", "Session destroyed")
     }
 
@@ -216,39 +314,73 @@ class ArCoreRenderer(
         GLES20.glClearColor(0.1f, 0.1f, 0.1f, 1.0f)
         backgroundRenderer.createOnGlThread(context)
         session?.setCameraTextureName(backgroundRenderer.textureId)
-        Log.d("ArCoreRenderer", "Surface created, texture ID: ${backgroundRenderer.textureId}")
+        Log.d("ArCoreRenderer", "Surface created; texture = ${backgroundRenderer.textureId}")
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
+        viewportWidth = width
+        viewportHeight = height
+
         GLES20.glViewport(0, 0, width, height)
-        session?.setDisplayGeometry(0, width, height)
-        Log.d("ArCoreRenderer", "Surface changed: ${width}x${height}")
+
+        val rotation = (context as? Activity)
+            ?.windowManager
+            ?.defaultDisplay
+            ?.rotation ?: Surface.ROTATION_0
+
+        session?.setDisplayGeometry(rotation, width, height)
+        Log.d("ArCoreRenderer", "Surface changed: ${width}x${height}, rotation=$rotation")
     }
 
     override fun onDrawFrame(gl: GL10?) {
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
 
-        val currentSession = session ?: return
+        val currentSession = session ?: run {
+            onPoseUpdate("Session not ready", TrackingState.STOPPED, null)
+            return
+        }
 
         try {
+            // 🔥 IMPORTANT: keep display geometry updated every frame
+            if (viewportWidth > 0 && viewportHeight > 0) {
+                val rotation = (context as? Activity)
+                    ?.windowManager
+                    ?.defaultDisplay
+                    ?.rotation ?: Surface.ROTATION_0
+                currentSession.setDisplayGeometry(rotation, viewportWidth, viewportHeight)
+            }
+
             currentSession.setCameraTextureName(backgroundRenderer.textureId)
+
             val frame = currentSession.update()
             val camera = frame.camera
 
+            // Draw the camera image with correct UVs
             backgroundRenderer.draw(frame)
 
-            val trackingState = camera.trackingState
-            if (trackingState == TrackingState.TRACKING && isTracking) {
-                val pose = camera.pose
-                val point = PathPoint(
-                    pose.tx(),
-                    pose.ty(),
-                    pose.tz(),
-                    System.currentTimeMillis()
-                )
-                onPoseUpdate(pose.toShortString(), trackingState, point)
-            } else {
-                onPoseUpdate("State: ${trackingState.name}", trackingState, null)
+            when (camera.trackingState) {
+                TrackingState.TRACKING -> {
+                    val pose = camera.pose
+                    val point = PathPoint(
+                        pose.tx(),
+                        pose.ty(),
+                        pose.tz(),
+                        System.currentTimeMillis()
+                    )
+                    onPoseUpdate(pose.toShortString(), TrackingState.TRACKING, point)
+                }
+
+                TrackingState.PAUSED -> {
+                    onPoseUpdate(
+                        "Tracking paused – move slowly & point at textured surfaces",
+                        TrackingState.PAUSED,
+                        null
+                    )
+                }
+
+                TrackingState.STOPPED -> {
+                    onPoseUpdate("Tracking stopped", TrackingState.STOPPED, null)
+                }
             }
         } catch (e: CameraNotAvailableException) {
             Log.e("ArCoreRenderer", "Camera not available", e)
@@ -258,6 +390,86 @@ class ArCoreRenderer(
         }
     }
 }
+
+// -----------------------------------------------------------------------------
+// ArCoreView – GLSurfaceView + GL-thread-safe lifecycle observer
+// -----------------------------------------------------------------------------
+
+@Composable
+fun ArCoreView(
+    modifier: Modifier = Modifier,
+    onPoseUpdate: (String, TrackingState, PathPoint?) -> Unit,
+    lifecycleOwner: androidx.lifecycle.LifecycleOwner
+) {
+    val context = LocalContext.current
+
+    AndroidView(
+        modifier = modifier,
+        factory = { ctx ->
+            object : GLSurfaceView(ctx) {
+                private val renderer = ArCoreRenderer(ctx, onPoseUpdate)
+
+                init {
+                    setEGLContextClientVersion(2)
+                    preserveEGLContextOnPause = true
+                    setEGLConfigChooser(8, 8, 8, 8, 16, 0)
+
+                    setRenderer(renderer)
+                    renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
+
+                    val observer = LifecycleEventObserver { _, event ->
+                        when (event) {
+                            Lifecycle.Event.ON_RESUME -> {
+                                queueEvent {
+                                    renderer.createSessionIfNeeded()
+                                    renderer.resume()
+                                }
+                                onResume()
+                            }
+
+                            Lifecycle.Event.ON_PAUSE -> {
+                                queueEvent {
+                                    renderer.pause()
+                                }
+                                onPause()
+                            }
+
+                            Lifecycle.Event.ON_DESTROY -> {
+                                queueEvent {
+                                    renderer.destroy()
+                                }
+                            }
+
+                            else -> Unit
+                        }
+                    }
+
+                    lifecycleOwner.lifecycle.addObserver(observer)
+
+                    // Ensure lifecycle observer and renderer are cleaned up when the view is detached.
+                    val attachListener = object : View.OnAttachStateChangeListener {
+                        override fun onViewAttachedToWindow(v: View) { /* no-op */ }
+                        override fun onViewDetachedFromWindow(v: View) {
+                            try {
+                                lifecycleOwner.lifecycle.removeObserver(observer)
+                            } catch (t: Throwable) {
+                                Log.w("ArCoreView", "Failed to remove lifecycle observer", t)
+                            }
+                            queueEvent {
+                                try { renderer.destroy() } catch (_: Exception) {}
+                            }
+                            removeOnAttachStateChangeListener(this)
+                        }
+                    }
+                    addOnAttachStateChangeListener(attachListener)
+                }
+            }
+        }
+    )
+}
+// -----------------------------------------------------------------------------
+// SLAM Screen – Main UI (Compose)
+// -----------------------------------------------------------------------------
 
 @OptIn(ExperimentalPermissionsApi::class, ExperimentalMaterial3Api::class)
 @Composable
@@ -269,12 +481,14 @@ fun SlamScreen() {
     var trackingState by remember { mutableStateOf(TrackingState.STOPPED) }
     var arCoreError by remember { mutableStateOf<String?>(null) }
     var arInstallAttempted by remember { mutableStateOf(false) }
+
     var isRecording by remember { mutableStateOf(false) }
     var showGraph by remember { mutableStateOf(false) }
 
     val pathPoints = remember { mutableStateListOf<PathPoint>() }
     var totalDistance by remember { mutableStateOf(0f) }
 
+    // Camera permission
     val cameraPermission = rememberPermissionState(Manifest.permission.CAMERA)
 
     LaunchedEffect(Unit) {
@@ -283,6 +497,7 @@ fun SlamScreen() {
         }
     }
 
+    // ARCore installation
     LaunchedEffect(cameraPermission.status) {
         if (!cameraPermission.status.isGranted) {
             arCoreError = "Camera permission required"
@@ -290,32 +505,34 @@ fun SlamScreen() {
         }
 
         try {
-            when (ArCoreApk.getInstance().requestInstall(
-                context as android.app.Activity,
+            val installResult = ArCoreApk.getInstance().requestInstall(
+                context as Activity,
                 !arInstallAttempted
-            )) {
+            )
+            when (installResult) {
                 ArCoreApk.InstallStatus.INSTALL_REQUESTED -> {
                     arInstallAttempted = true
                     slamPose = "Installing ARCore..."
                     return@LaunchedEffect
                 }
+
                 ArCoreApk.InstallStatus.INSTALLED -> {
                     arCoreError = null
                 }
-                else -> {}
             }
         } catch (e: Exception) {
             arCoreError = when (e) {
                 is UnavailableApkTooOldException -> "ARCore APK too old"
                 is UnavailableSdkTooOldException -> "SDK too old"
                 is UnavailableDeviceNotCompatibleException -> "Device not compatible"
-                is UnavailableUserDeclinedInstallationException -> "Installation declined"
+                is UnavailableUserDeclinedInstallationException -> "User declined ARCore installation"
                 else -> "ARCore error: ${e.message}"
             }
-            Log.e("SlamScreen", "ARCore error", e)
+            Log.e("SlamScreen", "ARCore install error", e)
         }
     }
 
+    // ---------------- GRAPH SCREEN ----------------
     if (showGraph) {
         PathGraphScreen(
             pathPoints = pathPoints.toList(),
@@ -326,173 +543,168 @@ fun SlamScreen() {
                 totalDistance = 0f
             }
         )
-    } else {
-        Scaffold(
-            topBar = {
-                CenterAlignedTopAppBar(
-                    title = { Text("SLAM Path Tracker", fontWeight = FontWeight.Bold) },
-                    colors = TopAppBarDefaults.centerAlignedTopAppBarColors(
-                        containerColor = MaterialTheme.colorScheme.primaryContainer
-                    )
+        return
+    }
+
+    // ---------------- MAIN UI ----------------
+    Scaffold(
+        topBar = {
+            CenterAlignedTopAppBar(
+                title = { Text("SLAM Path Tracker", fontWeight = FontWeight.Bold) },
+                colors = TopAppBarDefaults.centerAlignedTopAppBarColors(
+                    containerColor = MaterialTheme.colorScheme.primaryContainer
                 )
-            }
-        ) { padding ->
-            Box(
-                modifier = Modifier
-                    .padding(padding)
-                    .fillMaxSize()
-                    .background(Color.Black)
-            ) {
-                if (cameraPermission.status.isGranted && arCoreError == null) {
-                    ArCoreView(
-                        modifier = Modifier.fillMaxSize(),
-                        onPoseUpdate = { pose, state, point ->
-                            slamPose = pose
-                            trackingState = state
-                            if (isRecording && point != null) {
-                                if (pathPoints.isNotEmpty()) {
-                                    val last = pathPoints.last()
-                                    val dist = kotlin.math.sqrt(
-                                        (point.x - last.x) * (point.x - last.x) +
-                                                (point.y - last.y) * (point.y - last.y) +
-                                                (point.z - last.z) * (point.z - last.z)
-                                    )
-                                    if (dist > 0.01f) { // Only add if moved > 1cm
-                                        totalDistance += dist
-                                        pathPoints.add(point)
-                                    }
-                                } else {
+            )
+        }
+    ) { padding ->
+        Box(
+            modifier = Modifier
+                .padding(padding)
+                .fillMaxSize()
+                .background(Color.Black)
+        ) {
+            if (cameraPermission.status.isGranted && arCoreError == null) {
+                ArCoreView(
+                    modifier = Modifier.fillMaxSize(),
+                    onPoseUpdate = { pose, state, point ->
+                        slamPose = pose
+                        trackingState = state
+
+                        if (isRecording && point != null && state == TrackingState.TRACKING) {
+                            if (pathPoints.isNotEmpty()) {
+                                val last = pathPoints.last()
+                                val dx = point.x - last.x
+                                val dy = point.y - last.y
+                                val dz = point.z - last.z
+                                val dist = sqrt(dx * dx + dy * dy + dz * dz)
+
+                                if (dist > 0.01f) {
+                                    totalDistance += dist
                                     pathPoints.add(point)
                                 }
+                            } else {
+                                pathPoints.add(point)
                             }
-                        },
-                        lifecycleOwner = lifecycleOwner
+                        }
+                    },
+                    lifecycleOwner = lifecycleOwner
+                )
+
+                // Mini-map overlay with recent points
+                PointsOverlay(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(16.dp)
+                        .size(140.dp),
+                    pathPoints = pathPoints.toList()
+                )
+
+                // Controls overlay
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .align(Alignment.BottomCenter)
+                        .background(
+                            Brush.verticalGradient(
+                                listOf(Color.Transparent, Color(0xAA000000), Color.Black)
+                            )
+                        )
+                        .padding(16.dp)
+                ) {
+                    // Status indicator
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(
+                            modifier = Modifier
+                                .size(12.dp)
+                                .background(
+                                    when (trackingState) {
+                                        TrackingState.TRACKING -> Color.Green
+                                        TrackingState.PAUSED -> Color.Yellow
+                                        else -> Color.Red
+                                    },
+                                    shape = androidx.compose.foundation.shape.CircleShape
+                                )
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            "ARCore: ${trackingState.name}",
+                            color = Color.White,
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+
+                    Spacer(Modifier.height(8.dp))
+
+                    Text(
+                        slamPose,
+                        color = Color.White,
+                        fontSize = 14.sp,
+                        fontFamily = FontFamily.Monospace,
+                        lineHeight = 20.sp
                     )
 
-                    // Controls Overlay
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .align(Alignment.BottomCenter)
-                            .background(
-                                Brush.verticalGradient(
-                                    listOf(Color.Transparent, Color(0xAA000000), Color.Black)
-                                )
-                            )
-                            .padding(16.dp)
+                    Spacer(Modifier.height(8.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        // Status
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Box(
-                                modifier = Modifier
-                                    .size(12.dp)
-                                    .background(
-                                        when (trackingState) {
-                                            TrackingState.TRACKING -> Color.Green
-                                            TrackingState.PAUSED -> Color.Yellow
-                                            else -> Color.Red
-                                        },
-                                        shape = androidx.compose.foundation.shape.CircleShape
-                                    )
-                            )
-                            Spacer(Modifier.width(8.dp))
-                            Text(
-                                "ARCore: ${trackingState.name}",
-                                color = Color.White,
-                                fontSize = 16.sp,
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
+                        Text("Points: ${pathPoints.size}", color = Color.Gray)
+                        Text("Distance: ${totalDistance.format(2)}m", color = Color.Gray)
+                    }
 
-                        Spacer(Modifier.height(8.dp))
+                    Spacer(Modifier.height(16.dp))
 
-                        Text(
-                            slamPose,
-                            color = Color.White,
-                            fontSize = 14.sp,
-                            fontFamily = FontFamily.Monospace,
-                            lineHeight = 20.sp
-                        )
-
-                        Spacer(Modifier.height(8.dp))
-
-                        // Stats
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Text(
-                                "Points: ${pathPoints.size}",
-                                color = Color(0xFFBBBBBB),
-                                fontSize = 14.sp
-                            )
-                            Text(
-                                "Distance: ${totalDistance.format(2)}m",
-                                color = Color(0xFFBBBBBB),
-                                fontSize = 14.sp
-                            )
-                        }
-
-                        Spacer(Modifier.height(16.dp))
-
-                        // Control Buttons
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            Button(
-                                onClick = {
-                                    if (isRecording) {
-                                        isRecording = false
-                                        if (pathPoints.size > 1) {
-                                            showGraph = true
-                                        }
-                                    } else {
-                                        isRecording = true
-                                        pathPoints.clear()
-                                        totalDistance = 0f
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Button(
+                            onClick = {
+                                if (isRecording) {
+                                    isRecording = false
+                                    if (pathPoints.size > 1) {
+                                        showGraph = true
                                     }
-                                },
-                                modifier = Modifier.weight(1f),
-                                enabled = trackingState == TrackingState.TRACKING,
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = if (isRecording) Color.Red else Color.Green
-                                )
-                            ) {
-                                Text(if (isRecording) "Stop Recording" else "Start Recording")
-                            }
-
-                            if (pathPoints.size > 1 && !isRecording) {
-                                Button(
-                                    onClick = { showGraph = true },
-                                    modifier = Modifier.weight(1f)
-                                ) {
-                                    Text("View Path")
+                                } else {
+                                    isRecording = true
+                                    pathPoints.clear()
+                                    totalDistance = 0f
                                 }
+                            },
+                            enabled = trackingState == TrackingState.TRACKING,
+                            modifier = Modifier.weight(1f),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (isRecording) Color.Red else Color.Green
+                            )
+                        ) {
+                            Text(if (isRecording) "Stop Recording" else "Start Recording")
+                        }
+
+                        if (!isRecording && pathPoints.size > 1) {
+                            Button(
+                                onClick = { showGraph = true },
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("View Path")
                             }
                         }
                     }
-                } else {
-                    Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
-                        Column(
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            modifier = Modifier.padding(24.dp)
-                        ) {
-                            if (!cameraPermission.status.isGranted) {
-                                Text(
-                                    "Camera Permission Required",
-                                    color = Color.White,
-                                    fontSize = 20.sp,
-                                    fontWeight = FontWeight.Bold
-                                )
-                                Spacer(Modifier.height(16.dp))
-                                Button(onClick = { cameraPermission.launchPermissionRequest() }) {
-                                    Text("Grant Permission")
-                                }
-                            } else if (arCoreError != null) {
-                                Text(arCoreError!!, color = Color.Red, fontSize = 16.sp)
-                            }
+                }
+            } else {
+                Column(
+                    modifier = Modifier.align(Alignment.Center),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    if (!cameraPermission.status.isGranted) {
+                        Text("Camera Permission Required", color = Color.White, fontSize = 20.sp)
+                        Spacer(Modifier.height(12.dp))
+                        Button(onClick = { cameraPermission.launchPermissionRequest() }) {
+                            Text("Grant Permission")
                         }
+                    } else if (arCoreError != null) {
+                        Text(arCoreError!!, color = Color.Red, fontSize = 16.sp)
                     }
                 }
             }
@@ -500,49 +712,66 @@ fun SlamScreen() {
     }
 }
 
+// -----------------------------------------------------------------------------
+// PointsOverlay — small top-down minimap of recorded X-Z points
+// -----------------------------------------------------------------------------
+
 @Composable
-fun ArCoreView(
+fun PointsOverlay(
     modifier: Modifier = Modifier,
-    onPoseUpdate: (String, TrackingState, PathPoint?) -> Unit,
-    lifecycleOwner: androidx.lifecycle.LifecycleOwner
+    pathPoints: List<PathPoint>,
+    maxPoints: Int = 200
 ) {
-    val context = LocalContext.current
+    if (pathPoints.isEmpty()) return
 
-    AndroidView(
-        factory = { ctx ->
-            GLSurfaceView(ctx).apply {
-                setEGLContextClientVersion(2)
-                preserveEGLContextOnPause = true
-                setEGLConfigChooser(8, 8, 8, 8, 16, 0)
+    val display = pathPoints.takeLast(maxPoints)
+    Canvas(modifier = modifier) {
+        val padding = 8.dp.toPx()
+        val w = size.width - padding * 2
+        val h = size.height - padding * 2
 
-                val renderer = ArCoreRenderer(ctx, onPoseUpdate)
+        // Background
+        drawRoundRect(
+            color = Color(0xAA000000),
+            topLeft = Offset(0f, 0f),
+            size = size,
+            cornerRadius = androidx.compose.ui.geometry.CornerRadius(12f, 12f)
+        )
 
-                setRenderer(renderer)
-                renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
+        // compute bounds on X (horizontal) and Z (vertical/top-down)
+        val xs = display.map { it.x }
+        val zs = display.map { it.z }
+        val minX = xs.minOrNull() ?: 0f
+        val maxX = xs.maxOrNull() ?: 0f
+        val minZ = zs.minOrNull() ?: 0f
+        val maxZ = zs.maxOrNull() ?: 0f
+        val range = max(maxX - minX, maxZ - minZ).coerceAtLeast(0.1f)
 
-                val observer = LifecycleEventObserver { _, event ->
-                    when (event) {
-                        Lifecycle.Event.ON_RESUME -> {
-                            renderer.createSession()
-                            onResume()
-                            renderer.resume()
-                        }
-                        Lifecycle.Event.ON_PAUSE -> {
-                            onPause()
-                            renderer.pause()
-                        }
-                        Lifecycle.Event.ON_DESTROY -> {
-                            renderer.destroy()
-                        }
-                        else -> {}
-                    }
-                }
-                lifecycleOwner.lifecycle.addObserver(observer)
-            }
-        },
-        modifier = modifier
-    )
+        // Draw path points (older are dimmer)
+        display.forEachIndexed { i, p ->
+            val fx = padding + ((p.x - minX) / range) * w
+            val fy = padding + ((p.z - minZ) / range) * h
+            val t = i.toFloat() / (display.size.coerceAtLeast(1))
+            val alpha = 0.25f + 0.75f * t
+            drawCircle(
+                color = Color.Cyan.copy(alpha = alpha),
+                radius = 4f,
+                center = Offset(fx, fy)
+            )
+        }
+
+        // Current (last) position marker
+        val last = display.last()
+        val lx = padding + ((last.x - minX) / range) * w
+        val ly = padding + ((last.z - minZ) / range) * h
+        drawCircle(Color.Yellow, radius = 7f, center = Offset(lx, ly))
+        drawCircle(Color.Black, radius = 2f, center = Offset(lx, ly))
+    }
 }
+
+// -----------------------------------------------------------------------------
+// Path Graph Screen
+// -----------------------------------------------------------------------------
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -570,7 +799,6 @@ fun PathGraphScreen(
                 .background(Color.White)
                 .padding(16.dp)
         ) {
-            // Stats
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
@@ -587,7 +815,6 @@ fun PathGraphScreen(
 
             Spacer(Modifier.height(16.dp))
 
-            // 2D Path Graph (Top View: X-Z plane)
             Text("Top View (X-Z Plane)", fontSize = 16.sp, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(8.dp))
 
@@ -599,57 +826,55 @@ fun PathGraphScreen(
             ) {
                 if (pathPoints.size < 2) return@Canvas
 
-                val xValues = pathPoints.map { it.x }
-                val zValues = pathPoints.map { it.z }
+                val xs = pathPoints.map { it.x }
+                val zs = pathPoints.map { it.z }
 
-                val minX = xValues.minOrNull() ?: 0f
-                val maxX = xValues.maxOrNull() ?: 0f
-                val minZ = zValues.minOrNull() ?: 0f
-                val maxZ = zValues.maxOrNull() ?: 0f
+                val minX = xs.minOrNull() ?: 0f
+                val maxX = xs.maxOrNull() ?: 0f
+                val minZ = zs.minOrNull() ?: 0f
+                val maxZ = zs.maxOrNull() ?: 0f
 
                 val padding = 40f
-                val width = size.width - 2 * padding
-                val height = size.height - 2 * padding
+                val width = size.width - padding * 2
+                val height = size.height - padding * 2
 
-                val rangeX = maxX - minX
-                val rangeZ = maxZ - minZ
-                val range = max(rangeX, rangeZ).coerceAtLeast(0.1f)
+                val range = max(maxX - minX, maxZ - minZ).coerceAtLeast(0.1f)
 
                 val path = Path()
-                pathPoints.forEachIndexed { index, point ->
-                    val x = padding + ((point.x - minX) / range) * width
-                    val y = padding + ((point.z - minZ) / range) * height
 
-                    if (index == 0) {
-                        path.moveTo(x, y)
-                    } else {
-                        path.lineTo(x, y)
-                    }
+                pathPoints.forEachIndexed { index, p ->
+                    val x = padding + ((p.x - minX) / range) * width
+                    val y = padding + ((p.z - minZ) / range) * height
+
+                    if (index == 0) path.moveTo(x, y) else path.lineTo(x, y)
                 }
 
-                drawPath(
-                    path = path,
-                    color = Color.Blue,
-                    style = Stroke(width = 4f)
+                drawPath(path, color = Color.Blue, style = Stroke(width = 4f))
+
+                // Start point
+                drawCircle(
+                    Color.Green,
+                    radius = 12f,
+                    center = Offset(
+                        padding + ((pathPoints.first().x - minX) / range) * width,
+                        padding + ((pathPoints.first().z - minZ) / range) * height
+                    )
                 )
 
-                // Draw start point
-                val firstX = padding + ((pathPoints.first().x - minX) / range) * width
-                val firstZ = padding + ((pathPoints.first().z - minZ) / range) * height
-                drawCircle(Color.Green, radius = 12f, center = Offset(firstX, firstZ))
-
-                // Draw end point
-                val lastX = padding + ((pathPoints.last().x - minX) / range) * width
-                val lastZ = padding + ((pathPoints.last().z - minZ) / range) * height
-                drawCircle(Color.Red, radius = 12f, center = Offset(lastX, lastZ))
+                // End point
+                drawCircle(
+                    Color.Red,
+                    radius = 12f,
+                    center = Offset(
+                        padding + ((pathPoints.last().x - minX) / range) * width,
+                        padding + ((pathPoints.last().z - minZ) / range) * height
+                    )
+                )
             }
 
             Spacer(Modifier.height(16.dp))
 
-            Button(
-                onClick = onBack,
-                modifier = Modifier.fillMaxWidth()
-            ) {
+            Button(onClick = onBack, modifier = Modifier.fillMaxWidth()) {
                 Text("Close")
             }
         }
