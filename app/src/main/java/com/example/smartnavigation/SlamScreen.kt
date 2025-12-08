@@ -8,6 +8,7 @@ import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.util.Log
 import android.view.Surface
+import android.view.View
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -138,11 +139,33 @@ class BackgroundRenderer {
         val vs = loadShader(GLES20.GL_VERTEX_SHADER, vertexShaderCode)
         val fs = loadShader(GLES20.GL_FRAGMENT_SHADER, fragmentShaderCode)
 
-        quadProgram = GLES20.glCreateProgram().also {
-            GLES20.glAttachShader(it, vs)
-            GLES20.glAttachShader(it, fs)
-            GLES20.glLinkProgram(it)
+        if (vs == 0 || fs == 0) {
+            Log.e("BackgroundRenderer", "Shader creation failed; vs=$vs fs=$fs")
+            quadProgram = 0
+            return
         }
+
+        val program = GLES20.glCreateProgram()
+        if (program == 0) {
+            Log.e("BackgroundRenderer", "Could not create GL program")
+            quadProgram = 0
+            return
+        }
+
+        GLES20.glAttachShader(program, vs)
+        GLES20.glAttachShader(program, fs)
+        GLES20.glLinkProgram(program)
+
+        val linkStatus = IntArray(1)
+        GLES20.glGetProgramiv(program, GLES20.GL_LINK_STATUS, linkStatus, 0)
+        if (linkStatus[0] == 0) {
+            Log.e("BackgroundRenderer", "Program link error: ${GLES20.glGetProgramInfoLog(program)}")
+            GLES20.glDeleteProgram(program)
+            quadProgram = 0
+            return
+        }
+
+        quadProgram = program
 
         quadPositionParam = GLES20.glGetAttribLocation(quadProgram, "a_Position")
         quadTexCoordParam = GLES20.glGetAttribLocation(quadProgram, "a_TexCoord")
@@ -153,6 +176,33 @@ class BackgroundRenderer {
         quadTexCoordsTransformed = ByteBuffer.allocateDirect(QUAD_TEXCOORDS.size * FLOAT_SIZE)
             .order(ByteOrder.nativeOrder())
             .asFloatBuffer()
+    }
+
+    private fun allocFloatBuffer(array: FloatArray): FloatBuffer =
+        ByteBuffer.allocateDirect(array.size * FLOAT_SIZE)
+            .order(ByteOrder.nativeOrder())
+            .asFloatBuffer()
+            .apply {
+                put(array)
+                position(0)
+            }
+
+    private fun loadShader(type: Int, code: String): Int {
+        val shader = GLES20.glCreateShader(type)
+        if (shader == 0) {
+            Log.e("BackgroundRenderer", "Could not create shader of type $type")
+            return 0
+        }
+        GLES20.glShaderSource(shader, code)
+        GLES20.glCompileShader(shader)
+        val compiled = IntArray(1)
+        GLES20.glGetShaderiv(shader, GLES20.GL_COMPILE_STATUS, compiled, 0)
+        if (compiled[0] == 0) {
+            Log.e("BackgroundRenderer", "Shader compile error: ${GLES20.glGetShaderInfoLog(shader)}")
+            GLES20.glDeleteShader(shader)
+            return 0
+        }
+        return shader
     }
 
     private fun allocFloatBuffer(array: FloatArray): FloatBuffer =
@@ -177,6 +227,8 @@ class BackgroundRenderer {
         }
 
     fun draw(frame: Frame) {
+        if (quadProgram == 0) return
+
         GLES20.glDisable(GLES20.GL_DEPTH_TEST)
         GLES20.glDepthMask(false)
 
@@ -414,6 +466,23 @@ fun ArCoreView(
                     }
 
                     lifecycleOwner.lifecycle.addObserver(observer)
+
+                    // Ensure lifecycle observer and renderer are cleaned up when the view is detached.
+                    val attachListener = object : View.OnAttachStateChangeListener {
+                        override fun onViewAttachedToWindow(v: View) { /* no-op */ }
+                        override fun onViewDetachedFromWindow(v: View) {
+                            try {
+                                lifecycleOwner.lifecycle.removeObserver(observer)
+                            } catch (t: Throwable) {
+                                Log.w("ArCoreView", "Failed to remove lifecycle observer", t)
+                            }
+                            queueEvent {
+                                try { renderer.destroy() } catch (_: Exception) {}
+                            }
+                            removeOnAttachStateChangeListener(this)
+                        }
+                    }
+                    addOnAttachStateChangeListener(attachListener)
                 }
             }
         }
@@ -542,6 +611,15 @@ fun SlamScreen() {
                     lifecycleOwner = lifecycleOwner
                 )
 
+                // Mini-map overlay with recent points
+                PointsOverlay(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(16.dp)
+                        .size(140.dp),
+                    pathPoints = pathPoints.toList()
+                )
+
                 // Controls overlay
                 Column(
                     modifier = Modifier
@@ -652,6 +730,63 @@ fun SlamScreen() {
                 }
             }
         }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// PointsOverlay — small top-down minimap of recorded X-Z points
+// -----------------------------------------------------------------------------
+
+@Composable
+fun PointsOverlay(
+    modifier: Modifier = Modifier,
+    pathPoints: List<PathPoint>,
+    maxPoints: Int = 200
+) {
+    if (pathPoints.isEmpty()) return
+
+    val display = pathPoints.takeLast(maxPoints)
+    Canvas(modifier = modifier) {
+        val padding = 8.dp.toPx()
+        val w = size.width - padding * 2
+        val h = size.height - padding * 2
+
+        // Background
+        drawRoundRect(
+            color = Color(0xAA000000),
+            topLeft = Offset(0f, 0f),
+            size = size,
+            cornerRadius = androidx.compose.ui.geometry.CornerRadius(12f, 12f)
+        )
+
+        // compute bounds on X (horizontal) and Z (vertical/top-down)
+        val xs = display.map { it.x }
+        val zs = display.map { it.z }
+        val minX = xs.minOrNull() ?: 0f
+        val maxX = xs.maxOrNull() ?: 0f
+        val minZ = zs.minOrNull() ?: 0f
+        val maxZ = zs.maxOrNull() ?: 0f
+        val range = max(maxX - minX, maxZ - minZ).coerceAtLeast(0.1f)
+
+        // Draw path points (older are dimmer)
+        display.forEachIndexed { i, p ->
+            val fx = padding + ((p.x - minX) / range) * w
+            val fy = padding + ((p.z - minZ) / range) * h
+            val t = i.toFloat() / (display.size.coerceAtLeast(1))
+            val alpha = 0.25f + 0.75f * t
+            drawCircle(
+                color = Color.Cyan.copy(alpha = alpha),
+                radius = 4f,
+                center = Offset(fx, fy)
+            )
+        }
+
+        // Current (last) position marker
+        val last = display.last()
+        val lx = padding + ((last.x - minX) / range) * w
+        val ly = padding + ((last.z - minZ) / range) * h
+        drawCircle(Color.Yellow, radius = 7f, center = Offset(lx, ly))
+        drawCircle(Color.Black, radius = 2f, center = Offset(lx, ly))
     }
 }
 
