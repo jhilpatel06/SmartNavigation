@@ -130,6 +130,22 @@ Include the following in your submission package:
 This project was developed as part of the course IE415 – Control of Autonomous Systems.  
 Credit: Google ARCore for the SLAM capability. Portions of code are adapted from public examples and are attributed in the report.
 
+## References
+1. **Simultaneous Localization and Mapping (SLAM)**
+   - Thrun, S., Burgard, W., & Fox, D. (2005). *Probabilistic Robotics*. MIT Press.
+   - Klein, G., & Murray, D. (2007). "Parallel Tracking and Mapping for Real-Time SLAM". ICCV 2007.
+
+2. **Dead Reckoning & Inertial Navigation**
+   - Titterton, D. H., & Weston, J. L. (2004). *Strapdown Inertial Navigation Technology*. The Aerospace Press.
+   - Woodman, O. J. (2007). "An introduction to inertial navigation". University of Cambridge Technical Report.
+
+3. **Feature Detection & Tracking**
+   - Rosten, E., & Drummond, T. (2006). "Machine Learning for High-Speed Corner Detection". ECCV 2006.
+   - Lucas, B. D., & Kanade, T. (1981). "An Iterative Image Registration Technique". IJCAI 1981.
+
+4. **Sensor Fusion**
+   - Welch, G., & Bishop, G. (2006). "An Introduction to the Kalman Filter". Siggraph Course.
+   - Sabatini, A. M. (2011). "Kalman-filter-based orientation determination using inertial/magnetic sensors". Journal of Biomechanics.
 ---
 
 
